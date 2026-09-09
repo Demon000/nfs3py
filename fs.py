@@ -103,13 +103,66 @@ def wcc_attr_dict(st: os.stat_result) -> dict:
     }
 
 
+def _vpath_join(vpath: str, name: str) -> str:
+    return vpath.rstrip('/') + '/' + name
+
+
+def _vpath_dirname(vpath: str) -> str:
+    parent = vpath.rstrip('/').rsplit('/', 1)[0]
+    return parent if parent else '/'
+
+
+class VirtualPath:
+    """A path as the NFS client sees it, lazily resolved to a real
+    filesystem path on every use so grafted sub-mounts (see
+    Filesystem.resolve_real_path) and ${arg} changes stay live."""
+
+    __slots__ = ('_fs', 'export_root', 'vpath')
+
+    def __init__(self, fs: 'Filesystem', export_root: str, vpath: str):
+        self._fs = fs
+        self.export_root = export_root
+        self.vpath = vpath
+
+    def __fspath__(self) -> str:
+        return str(self._fs.resolve_real_path(self.vpath))
+
+    def __truediv__(self, name: str) -> 'VirtualPath':
+        return VirtualPath(
+            self._fs, self.export_root, _vpath_join(self.vpath, name)
+        )
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, VirtualPath):
+            return self.vpath == other.vpath
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.vpath)
+
+    def __repr__(self) -> str:
+        return f'VirtualPath({self.vpath!r})'
+
+    @property
+    def parent(self) -> 'VirtualPath':
+        if self.vpath == self.export_root:
+            return self
+        parent_vpath = _vpath_dirname(self.vpath)
+        if not (
+            parent_vpath == self.export_root
+            or parent_vpath.startswith(self.export_root + '/')
+        ):
+            parent_vpath = self.export_root
+        return VirtualPath(self._fs, self.export_root, parent_vpath)
+
+
 class Filesystem:
     def __init__(
         self, mounts: list[tuple[str, str]], resolve: Callable[[str], str]
     ):
         self._mounts_cfg = mounts
         self._resolve = resolve
-        self._fh_to_entry: dict[bytes, tuple[Path, Path]] = {}
+        self._fh_to_entry: dict[bytes, VirtualPath] = {}
         self._lock = threading.RLock()
         self._writeverf = os.urandom(8)
         self.mount_list: list[tuple[str, str]] = []
@@ -124,17 +177,37 @@ class Filesystem:
             virt = self._resolve(src_file_path)
             if not real or not virt:
                 continue
-            exports[virt] = Path(real).resolve()
+            exports.setdefault(virt, Path(real).resolve())
         return exports
 
-    def stat(self, path: Path) -> os.stat_result:
+    def resolve_real_path(self, vpath: str) -> Path:
+        vpath = vpath.rstrip('/') or '/'
+        for dst_file_path, src_file_path in self._mounts_cfg:
+            real = self._resolve(dst_file_path)
+            virt = self._resolve(src_file_path)
+            if not real or not virt:
+                continue
+            virt = virt.rstrip('/') or '/'
+
+            if vpath == virt:
+                rel = ''
+            elif vpath.startswith(virt + '/'):
+                rel = vpath[len(virt) + 1 :]
+            else:
+                continue
+
+            real_path = Path(real).resolve()
+            return real_path.joinpath(rel) if rel else real_path
+        raise NfsError(NFS3ERR_NOENT)
+
+    def stat(self, path) -> os.stat_result:
         try:
             return os.lstat(path)
         except OSError as e:
             raise_for_oserror(e)
             raise AssertionError('unreachable')
 
-    def _register(self, root: Path, path: Path) -> bytes:
+    def _register(self, path: VirtualPath) -> bytes:
         st = self.stat(path)
         fh = struct.pack(
             '>QQ',
@@ -142,41 +215,41 @@ class Filesystem:
             st.st_ino & 0xFFFFFFFFFFFFFFFF,
         )
         with self._lock:
-            self._fh_to_entry[fh] = (root, path)
+            self._fh_to_entry[fh] = path
         return fh
 
     def mount_root_fh(self, dirpath: str) -> bytes:
         exports = self.refresh_exports()
-        real = exports.get(dirpath)
-        if real is None:
+        if dirpath not in exports:
             raise NfsError(NFS3ERR_NOENT)
-        return self._register(real, real)
+        return self._register(VirtualPath(self, dirpath, dirpath))
 
-    def resolve_fh(self, fh: bytes) -> tuple[Path, Path]:
+    def resolve_fh(self, fh: bytes) -> tuple[VirtualPath, VirtualPath]:
         with self._lock:
             entry = self._fh_to_entry.get(fh)
         if entry is None:
             raise NfsError(NFS3ERR_STALE)
-        return entry
+        return VirtualPath(self, entry.export_root, entry.export_root), entry
 
-    def fh_for_known_path(self, root: Path, path: Path) -> bytes:
-        return self._register(root, path)
+    def fh_for_known_path(self, root, path: VirtualPath) -> bytes:
+        del root
+        return self._register(path)
 
-    def lookup(self, dir_fh: bytes, name: str) -> tuple[bytes, Path, Path]:
+    def lookup(
+        self, dir_fh: bytes, name: str
+    ) -> tuple[bytes, VirtualPath, VirtualPath]:
         root, dir_path = self.resolve_fh(dir_fh)
         self._validate_lookup_name(name)
 
         if name == '.':
             child = dir_path
         elif name == '..':
-            child = dir_path.parent if dir_path != root else root
-            if not self._within_root(root, child):
-                child = root
+            child = dir_path.parent
         else:
             child = dir_path / name
 
         self.stat(child)
-        fh = self._register(root, child)
+        fh = self._register(child)
         return fh, child, root
 
     def _validate_lookup_name(self, name: str):
@@ -193,14 +266,7 @@ class Filesystem:
         if name in ('.', '..'):
             raise NfsError(NFS3ERR_EXIST)
 
-    def _within_root(self, root: Path, path: Path) -> bool:
-        try:
-            path.relative_to(root)
-            return True
-        except ValueError:
-            return path == root
-
-    def scandir_sorted(self, dir_path: Path) -> list[os.DirEntry]:
+    def scandir_sorted(self, dir_path) -> list[os.DirEntry]:
         try:
             with os.scandir(dir_path) as it:
                 entries = list(it)
@@ -211,11 +277,12 @@ class Filesystem:
         return entries
 
     def register_dir_entry(
-        self, root: Path, dir_path: Path, name: str
+        self, root, dir_path: VirtualPath, name: str
     ) -> bytes:
-        return self._register(root, dir_path / name)
+        del root
+        return self._register(dir_path / name)
 
-    def read(self, path: Path, offset: int, count: int) -> tuple[bytes, bool]:
+    def read(self, path, offset: int, count: int) -> tuple[bytes, bool]:
         try:
             with open(path, 'rb') as f:
                 f.seek(offset)
@@ -227,7 +294,7 @@ class Filesystem:
         eof = offset + len(data) >= size
         return data, eof
 
-    def write(self, path: Path, offset: int, data: bytes):
+    def write(self, path, offset: int, data: bytes):
         try:
             with open(path, 'r+b') as f:
                 f.seek(offset)
@@ -237,7 +304,9 @@ class Filesystem:
         except OSError as e:
             raise_for_oserror(e)
 
-    def create(self, dir_path: Path, name: str, exclusive: bool) -> Path:
+    def create(
+        self, dir_path: VirtualPath, name: str, exclusive: bool
+    ) -> VirtualPath:
         self.validate_create_name(name)
         target = dir_path / name
         flags = os.O_WRONLY | os.O_CREAT
@@ -249,7 +318,7 @@ class Filesystem:
             raise_for_oserror(e)
         return target
 
-    def mkdir(self, dir_path: Path, name: str) -> Path:
+    def mkdir(self, dir_path: VirtualPath, name: str) -> VirtualPath:
         self.validate_create_name(name)
         target = dir_path / name
         try:
@@ -258,7 +327,7 @@ class Filesystem:
             raise_for_oserror(e)
         return target
 
-    def remove(self, dir_path: Path, name: str):
+    def remove(self, dir_path: VirtualPath, name: str):
         self.validate_create_name(name)
         target = dir_path / name
         try:
@@ -269,7 +338,7 @@ class Filesystem:
             raise_for_oserror(e)
         self._forget(target)
 
-    def rmdir(self, dir_path: Path, name: str):
+    def rmdir(self, dir_path: VirtualPath, name: str):
         self.validate_create_name(name)
         target = dir_path / name
         try:
@@ -278,16 +347,18 @@ class Filesystem:
             raise_for_oserror(e)
         self._forget(target)
 
-    def _forget(self, path: Path):
+    def _forget(self, path: VirtualPath):
         with self._lock:
-            stale = [
-                fh for fh, (_r, p) in self._fh_to_entry.items() if p == path
-            ]
+            stale = [fh for fh, p in self._fh_to_entry.items() if p == path]
             for fh in stale:
                 del self._fh_to_entry[fh]
 
     def rename(
-        self, from_dir: Path, from_name: str, to_dir: Path, to_name: str
+        self,
+        from_dir: VirtualPath,
+        from_name: str,
+        to_dir: VirtualPath,
+        to_name: str,
     ):
         self.validate_create_name(from_name)
         self.validate_create_name(to_name)
@@ -299,19 +370,23 @@ class Filesystem:
             raise_for_oserror(e)
 
         with self._lock:
-            old_prefix = str(old_path) + os.sep
-            new_prefix = str(new_path) + os.sep
-            for fh, (root, path) in list(self._fh_to_entry.items()):
-                path_str = str(path)
-                if path_str == str(old_path):
-                    self._fh_to_entry[fh] = (root, new_path)
-                elif path_str.startswith(old_prefix):
-                    self._fh_to_entry[fh] = (
-                        root,
-                        Path(new_prefix + path_str[len(old_prefix) :]),
+            old_prefix = old_path.vpath + '/'
+            new_prefix = new_path.vpath + '/'
+            for fh, entry in list(self._fh_to_entry.items()):
+                if entry.vpath == old_path.vpath:
+                    self._fh_to_entry[fh] = VirtualPath(
+                        self, entry.export_root, new_path.vpath
+                    )
+                elif entry.vpath.startswith(old_prefix):
+                    self._fh_to_entry[fh] = VirtualPath(
+                        self,
+                        entry.export_root,
+                        new_prefix + entry.vpath[len(old_prefix) :],
                     )
 
-    def symlink(self, dir_path: Path, name: str, target: str) -> Path:
+    def symlink(
+        self, dir_path: VirtualPath, name: str, target: str
+    ) -> VirtualPath:
         self.validate_create_name(name)
         link_path = dir_path / name
         try:
@@ -320,14 +395,14 @@ class Filesystem:
             raise_for_oserror(e)
         return link_path
 
-    def readlink(self, path: Path) -> str:
+    def readlink(self, path) -> str:
         try:
             return os.readlink(path)
         except OSError as e:
             raise_for_oserror(e)
             raise AssertionError('unreachable')
 
-    def link(self, target_path: Path, dir_path: Path, name: str):
+    def link(self, target_path, dir_path: VirtualPath, name: str):
         self.validate_create_name(name)
         link_path = dir_path / name
         try:
@@ -335,7 +410,9 @@ class Filesystem:
         except OSError as e:
             raise_for_oserror(e)
 
-    def mknod(self, dir_path: Path, name: str, mode: int, device: int = 0):
+    def mknod(
+        self, dir_path: VirtualPath, name: str, mode: int, device: int = 0
+    ):
         self.validate_create_name(name)
         target = dir_path / name
         try:
@@ -348,7 +425,7 @@ class Filesystem:
 
     def setattr(
         self,
-        path: Path,
+        path,
         mode: int | None,
         uid: int | None,
         gid: int | None,
@@ -386,12 +463,12 @@ class Filesystem:
         except OSError as e:
             raise_for_oserror(e)
 
-    def statvfs(self, path: Path):
+    def statvfs(self, path):
         try:
             return os.statvfs(path)
         except OSError as e:
             raise_for_oserror(e)
             raise AssertionError('unreachable')
 
-    def access_ok(self, path: Path, mode: int) -> bool:
+    def access_ok(self, path, mode: int) -> bool:
         return os.access(path, mode)
