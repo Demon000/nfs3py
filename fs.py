@@ -295,6 +295,15 @@ class Filesystem:
         root, dir_path = self.resolve_fh(dir_fh)
         self._validate_lookup_name(name)
 
+        dir_st = self.stat(dir_path)
+        if not statmod.S_ISDIR(dir_st.st_mode):
+            # Without this, "looking up" a child of e.g. a symlink's own
+            # fh would silently string-concatenate a vpath instead of
+            # failing - which a real NFS client never actually does (it
+            # follows symlinks itself, via READLINK + re-resolving from
+            # the target), but is easy to get wrong by hand when testing.
+            raise NfsError(NFS3ERR_NOTDIR)
+
         if name == '.':
             child = dir_path
         elif name == '..':
