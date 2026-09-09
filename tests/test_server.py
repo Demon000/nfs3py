@@ -305,5 +305,94 @@ class Nfs3ServerTestCase(unittest.TestCase):
         self.assertEqual(r.u32(), 0)
 
 
+class GraftedMountTestCase(unittest.TestCase):
+    """A second real directory grafted onto a sub-path of an export -
+    e.g. serving a separately-built kernel modules tree at lib/modules
+    inside an exported rootfs without copying it in."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp(prefix='nfs3-graft-test-')
+        cls.export_dir = Path(cls.tmpdir) / 'export'
+        cls.graft_dir = Path(cls.tmpdir) / 'graft'
+        (cls.export_dir / 'lib').mkdir(parents=True)
+        cls.graft_dir.mkdir()
+        (cls.export_dir / 'lib' / 'libc.so.fake').write_bytes(b'from export\n')
+        (cls.graft_dir / 'foo.ko').write_bytes(b'from graft\n')
+
+        cls.port = _free_port()
+        config = _NfsConfig(
+            # graft listed before the broader export it nests under -
+            # first match in list order wins, same precedence rule as
+            # TFTP's dyn_file_func.
+            mounts=[
+                (str(cls.graft_dir), '/export/lib/modules'),
+                (str(cls.export_dir), '/export'),
+            ],
+            server_ip='127.0.0.1',
+            server_port=str(cls.port),
+        )
+        cls.server = NfsServer(config, lambda s: s)
+        cls.server.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.stop()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def setUp(self):
+        self.client = RpcClient('127.0.0.1', self.port)
+        self.addCleanup(self.client.close)
+        r = self.client.call(100005, 3, MOUNT_MNT, string('/export'))
+        self.assertEqual(r.u32(), 0)
+        self.root_fh = r.opaque()
+
+    def lookup(self, dir_fh, name):
+        r = self.client.call(100003, 3, LOOKUP, opaque(dir_fh) + string(name))
+        self.assertEqual(r.u32(), 0)
+        fh = r.opaque()
+        r.skip_post_op_attr()
+        r.skip_post_op_attr()
+        return fh
+
+    def read(self, fh):
+        args = opaque(fh) + u64(0) + u32(4096)
+        r = self.client.call(100003, 3, READ, args)
+        self.assertEqual(r.u32(), 0)
+        r.skip_post_op_attr()
+        r.u32()
+        r.bool()
+        return r.opaque()
+
+    def test_lookup_reaches_grafted_real_directory(self):
+        lib_fh = self.lookup(self.root_fh, 'lib')
+        modules_fh = self.lookup(lib_fh, 'modules')
+        foo_fh = self.lookup(modules_fh, 'foo.ko')
+        self.assertEqual(self.read(foo_fh), b'from graft\n')
+
+    def test_graft_does_not_shadow_sibling_files(self):
+        lib_fh = self.lookup(self.root_fh, 'lib')
+        libc_fh = self.lookup(lib_fh, 'libc.so.fake')
+        self.assertEqual(self.read(libc_fh), b'from export\n')
+
+    def test_dotdot_from_graft_returns_to_export_lib(self):
+        lib_fh = self.lookup(self.root_fh, 'lib')
+        modules_fh = self.lookup(lib_fh, 'modules')
+        back_fh = self.lookup(modules_fh, '..')
+        self.assertEqual(back_fh, lib_fh)
+
+    def test_write_inside_graft_lands_on_graft_disk_not_export(self):
+        lib_fh = self.lookup(self.root_fh, 'lib')
+        modules_fh = self.lookup(lib_fh, 'modules')
+        args = opaque(modules_fh) + string('bar.ko') + u32(0) + sattr3_unset()
+        r = self.client.call(100003, 3, CREATE, args)
+        self.assertEqual(r.u32(), 0)
+
+        self.assertTrue((self.graft_dir / 'bar.ko').exists())
+        self.assertFalse(
+            (self.export_dir / 'lib' / 'modules' / 'bar.ko').exists()
+        )
+
+
 if __name__ == '__main__':
     unittest.main()
