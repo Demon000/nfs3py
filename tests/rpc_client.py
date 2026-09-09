@@ -84,9 +84,18 @@ class RpcError(Exception):
 
 
 class RpcClient:
-    def __init__(self, host: str, port: int, timeout: float = 5):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        timeout: float = 5,
+        auth_uid: int | None = None,
+        auth_gid: int | None = None,
+    ):
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self._xid = 1
+        self._auth_uid = auth_uid
+        self._auth_gid = auth_gid
 
     def close(self):
         self.sock.close()
@@ -95,7 +104,17 @@ class RpcClient:
         xid = self._xid
         self._xid += 1
 
-        cred = u32(0) + opaque(b'')
+        if self._auth_uid is None:
+            cred = u32(0) + opaque(b'')
+        else:
+            authsys_body = (
+                u32(0)
+                + string('test')
+                + u32(self._auth_uid)
+                + u32(self._auth_gid or 0)
+                + u32(0)
+            )
+            cred = u32(1) + opaque(authsys_body)
         verf = u32(0) + opaque(b'')
         body = (
             u32(xid)

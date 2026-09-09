@@ -1,3 +1,4 @@
+import os
 import shutil
 import socket
 import tempfile
@@ -392,6 +393,126 @@ class GraftedMountTestCase(unittest.TestCase):
         self.assertFalse(
             (self.export_dir / 'lib' / 'modules' / 'bar.ko').exists()
         )
+
+
+class OwnershipMappingTestCase(unittest.TestCase):
+    """Lets the server report ownership (e.g. root-owned system files)
+    that differs from the real host uid/gid it's actually running as -
+    needed because the server runs unprivileged, so a real chown to an
+    arbitrary uid always fails, and files genuinely owned by another user
+    on the host are otherwise unreadable to it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp(prefix='nfs3-owner-test-')
+        cls.export_dir = Path(cls.tmpdir) / 'export'
+        cls.export_dir.mkdir()
+        (cls.export_dir / 'tagged.txt').write_bytes(b'x')
+        os.setxattr(
+            cls.export_dir / 'tagged.txt',
+            'user.nfs3_owner',
+            b'1234:5678',
+            follow_symlinks=False,
+        )
+
+        cls.port = _free_port()
+        config = _NfsConfig(
+            mounts=[(str(cls.export_dir), '/export')],
+            server_ip='127.0.0.1',
+            server_port=str(cls.port),
+        )
+        cls.server = NfsServer(config, lambda s: s)
+        cls.server.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.stop()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def setUp(self):
+        self.client = RpcClient('127.0.0.1', self.port)
+        self.addCleanup(self.client.close)
+        r = self.client.call(100005, 3, MOUNT_MNT, string('/export'))
+        self.assertEqual(r.u32(), 0)
+        self.root_fh = r.opaque()
+
+    def lookup(self, client, dir_fh, name):
+        r = client.call(100003, 3, LOOKUP, opaque(dir_fh) + string(name))
+        self.assertEqual(r.u32(), 0)
+        fh = r.opaque()
+        r.skip_post_op_attr()
+        r.skip_post_op_attr()
+        return fh
+
+    def getattr_owner(self, client, fh):
+        r = client.call(100003, 3, GETATTR, opaque(fh))
+        self.assertEqual(r.u32(), 0)
+        r.u32()  # type
+        r.u32()  # mode
+        r.u32()  # nlink
+        uid = r.u32()
+        gid = r.u32()
+        return uid, gid
+
+    def test_getattr_reports_xattr_tagged_owner_not_real_owner(self):
+        fh = self.lookup(self.client, self.root_fh, 'tagged.txt')
+        uid, gid = self.getattr_owner(self.client, fh)
+        self.assertEqual((uid, gid), (1234, 5678))
+        self.assertNotEqual((uid, gid), (os.getuid(), os.getgid()))
+
+    @unittest.skipIf(os.getuid() == 0, 'meaningless when run as root')
+    def test_setattr_owner_change_is_reported_without_needing_real_chown(
+        self,
+    ):
+        fh = self.lookup(self.client, self.root_fh, 'tagged.txt')
+        args = (
+            opaque(fh)
+            + u32(0)  # mode not set
+            + u32(1)
+            + u32(4242)  # uid set
+            + u32(1)
+            + u32(4343)  # gid set
+            + u32(0)  # size not set
+            + u32(0)  # atime DONT_CHANGE
+            + u32(0)  # mtime DONT_CHANGE
+            + u32(0)  # sattrguard3.check: no ctime guard
+        )
+        r = self.client.call(100003, 3, SETATTR, args)
+        self.assertEqual(r.u32(), 0)
+
+        uid, gid = self.getattr_owner(self.client, fh)
+        self.assertEqual((uid, gid), (4242, 4343))
+
+        real_st = os.stat(self.export_dir / 'tagged.txt')
+        self.assertEqual(real_st.st_uid, os.getuid())
+        self.assertNotEqual(real_st.st_uid, 4242)
+
+    @unittest.skipIf(os.getuid() == 0, 'meaningless when run as root')
+    def test_create_tags_new_file_with_claimed_auth_sys_owner(self):
+        privileged_client = RpcClient(
+            '127.0.0.1', self.port, auth_uid=0, auth_gid=0
+        )
+        self.addCleanup(privileged_client.close)
+        r = privileged_client.call(100005, 3, MOUNT_MNT, string('/export'))
+        self.assertEqual(r.u32(), 0)
+        root_fh = r.opaque()
+
+        args = (
+            opaque(root_fh)
+            + string('created_as_root.txt')
+            + u32(0)
+            + sattr3_unset()
+        )
+        r = privileged_client.call(100003, 3, CREATE, args)
+        self.assertEqual(r.u32(), 0)
+
+        fh = self.lookup(privileged_client, root_fh, 'created_as_root.txt')
+        uid, gid = self.getattr_owner(privileged_client, fh)
+        self.assertEqual((uid, gid), (0, 0))
+
+        real_st = os.stat(self.export_dir / 'created_as_root.txt')
+        self.assertNotEqual(real_st.st_uid, 0)
+        self.assertEqual(real_st.st_uid, os.getuid())
 
 
 if __name__ == '__main__':

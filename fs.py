@@ -59,6 +59,50 @@ def raise_for_oserror(e: OSError):
     raise NfsError(NFS3ERR_IO) from e
 
 
+OWNER_XATTR_NAME = 'user.nfs3_owner'
+
+
+def read_owner_xattr(path) -> tuple[int, int] | None:
+    try:
+        raw = os.getxattr(path, OWNER_XATTR_NAME, follow_symlinks=False)
+    except OSError:
+        return None
+    try:
+        uid_s, gid_s = raw.decode().split(':')
+        return int(uid_s), int(gid_s)
+    except ValueError:
+        return None
+
+
+def write_owner_xattr(path, uid: int, gid: int):
+    try:
+        os.setxattr(
+            path,
+            OWNER_XATTR_NAME,
+            f'{uid}:{gid}'.encode(),
+            follow_symlinks=False,
+        )
+    except OSError:
+        pass
+
+
+class _MappedStat:
+    """Wraps a real os.stat_result, overriding st_uid/st_gid with the
+    virtual ownership recorded in the file's user.nfs3_owner xattr, if
+    present. Lets every attribute-reporting call site keep reading
+    .st_uid/.st_gid exactly as if this were a real stat_result."""
+
+    __slots__ = ('_st', 'st_gid', 'st_uid')
+
+    def __init__(self, st: os.stat_result, uid: int, gid: int):
+        self._st = st
+        self.st_uid = uid
+        self.st_gid = gid
+
+    def __getattr__(self, name):
+        return getattr(self._st, name)
+
+
 def fattr3_dict(st: os.stat_result) -> dict:
     return {
         'type': ftype_for_stat(st),
@@ -202,10 +246,20 @@ class Filesystem:
 
     def stat(self, path) -> os.stat_result:
         try:
-            return os.lstat(path)
+            st = os.lstat(path)
         except OSError as e:
             raise_for_oserror(e)
             raise AssertionError('unreachable')
+        if statmod.S_ISLNK(st.st_mode):
+            # Linux doesn't support user.* xattrs on symlinks at all, so
+            # read_owner_xattr() would always miss here - skip the doomed
+            # syscall. Harmless: the kernel never consults a symlink's own
+            # ownership when following it, only the target's.
+            return st
+        owner = read_owner_xattr(path)
+        if owner is not None:
+            return _MappedStat(st, owner[0], owner[1])
+        return st
 
     def _register(self, path: VirtualPath) -> bytes:
         st = self.stat(path)
@@ -305,7 +359,11 @@ class Filesystem:
             raise_for_oserror(e)
 
     def create(
-        self, dir_path: VirtualPath, name: str, exclusive: bool
+        self,
+        dir_path: VirtualPath,
+        name: str,
+        exclusive: bool,
+        owner: tuple[int, int] | None = None,
     ) -> VirtualPath:
         self.validate_create_name(name)
         target = dir_path / name
@@ -316,15 +374,24 @@ class Filesystem:
             os.close(fd)
         except OSError as e:
             raise_for_oserror(e)
+        if owner is not None:
+            write_owner_xattr(target, *owner)
         return target
 
-    def mkdir(self, dir_path: VirtualPath, name: str) -> VirtualPath:
+    def mkdir(
+        self,
+        dir_path: VirtualPath,
+        name: str,
+        owner: tuple[int, int] | None = None,
+    ) -> VirtualPath:
         self.validate_create_name(name)
         target = dir_path / name
         try:
             os.mkdir(target, 0o755)
         except OSError as e:
             raise_for_oserror(e)
+        if owner is not None:
+            write_owner_xattr(target, *owner)
         return target
 
     def remove(self, dir_path: VirtualPath, name: str):
@@ -385,7 +452,11 @@ class Filesystem:
                     )
 
     def symlink(
-        self, dir_path: VirtualPath, name: str, target: str
+        self,
+        dir_path: VirtualPath,
+        name: str,
+        target: str,
+        owner: tuple[int, int] | None = None,
     ) -> VirtualPath:
         self.validate_create_name(name)
         link_path = dir_path / name
@@ -393,6 +464,9 @@ class Filesystem:
             os.symlink(target, link_path)
         except OSError as e:
             raise_for_oserror(e)
+        # Symlinks can't hold user.* xattrs at all (see stat()), so unlike
+        # create/mkdir/mknod there's no owner-tagging call to make here.
+        del owner
         return link_path
 
     def readlink(self, path) -> str:
@@ -411,7 +485,12 @@ class Filesystem:
             raise_for_oserror(e)
 
     def mknod(
-        self, dir_path: VirtualPath, name: str, mode: int, device: int = 0
+        self,
+        dir_path: VirtualPath,
+        name: str,
+        mode: int,
+        device: int = 0,
+        owner: tuple[int, int] | None = None,
     ):
         self.validate_create_name(name)
         target = dir_path / name
@@ -421,6 +500,8 @@ class Filesystem:
             raise NfsError(NFS3ERR_PERM) from e
         except OSError as e:
             raise_for_oserror(e)
+        if owner is not None:
+            write_owner_xattr(target, *owner)
         return target
 
     def setattr(
@@ -455,6 +536,21 @@ class Filesystem:
                     )
                 except PermissionError:
                     pass
+                # The real chown above only actually lands when the
+                # process has privilege to become the requested uid/gid
+                # (root, or already that uid). Record the requested
+                # ownership as reported (virtual) ownership regardless, so
+                # SETATTR still "works" from the client's point of view
+                # even when running unprivileged - see read_owner_xattr().
+                # Symlinks can't hold user.* xattrs at all, so skip them
+                # (matches stat()'s own skip for the same reason).
+                if not is_link:
+                    current = self.stat(path)
+                    write_owner_xattr(
+                        path,
+                        uid if uid is not None else current.st_uid,
+                        gid if gid is not None else current.st_gid,
+                    )
             if atime_ns is not None or mtime_ns is not None:
                 st = self.stat(path)
                 a = atime_ns if atime_ns is not None else st.st_atime_ns

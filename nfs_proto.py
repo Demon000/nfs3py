@@ -138,6 +138,12 @@ def _compute_cookieverf(dir_st) -> bytes:
     return (dir_st.st_mtime_ns & 0xFFFFFFFFFFFFFFFF).to_bytes(8, 'big')
 
 
+def _cred_owner(cred: ClientCred) -> tuple[int, int] | None:
+    if cred.uid is None or cred.gid is None:
+        return None
+    return cred.uid, cred.gid
+
+
 def build_handlers(fs: Filesystem) -> dict[int, Handler]:
     def null(args: XdrReader, res: XdrWriter, cred: ClientCred):
         pass
@@ -295,7 +301,12 @@ def build_handlers(fs: Filesystem) -> dict[int, Handler]:
         try:
             root, dir_path = fs.resolve_fh(dir_fh)
             pre = fs.stat(dir_path)
-            path = fs.create(dir_path, name, exclusive=(mode == EXCLUSIVE))
+            path = fs.create(
+                dir_path,
+                name,
+                exclusive=(mode == EXCLUSIVE),
+                owner=_cred_owner(cred),
+            )
             if sattr is not None:
                 _apply_sattr3(fs, path, sattr)
             fh = fs.fh_for_known_path(root, path)
@@ -318,7 +329,7 @@ def build_handlers(fs: Filesystem) -> dict[int, Handler]:
         try:
             root, dir_path = fs.resolve_fh(dir_fh)
             pre = fs.stat(dir_path)
-            path = fs.mkdir(dir_path, name)
+            path = fs.mkdir(dir_path, name, owner=_cred_owner(cred))
             _apply_sattr3(fs, path, sattr)
             fh = fs.fh_for_known_path(root, path)
             post_obj = fs.stat(path)
@@ -341,7 +352,7 @@ def build_handlers(fs: Filesystem) -> dict[int, Handler]:
         try:
             root, dir_path = fs.resolve_fh(dir_fh)
             pre = fs.stat(dir_path)
-            path = fs.symlink(dir_path, name, target)
+            path = fs.symlink(dir_path, name, target, owner=_cred_owner(cred))
             _apply_sattr3(fs, path, sattr)
             fh = fs.fh_for_known_path(root, path)
             post_obj = fs.stat(path)
@@ -387,7 +398,13 @@ def build_handlers(fs: Filesystem) -> dict[int, Handler]:
             perm = (
                 sattr['mode'] if sattr and sattr['mode'] is not None else 0o644
             )
-            path = fs.mknod(dir_path, name, base_mode | perm, device)
+            path = fs.mknod(
+                dir_path,
+                name,
+                base_mode | perm,
+                device,
+                owner=_cred_owner(cred),
+            )
             if sattr is not None:
                 sattr_no_mode = dict(sattr)
                 sattr_no_mode['mode'] = None
