@@ -190,8 +190,9 @@ def build_handlers(fs: Filesystem) -> dict[int, Handler]:
         try:
             _root, dir_path = fs.resolve_fh(dir_fh)
             dir_attrs = fs.stat(dir_path)
-            fh, child_path, _root2 = fs.lookup(dir_fh, name)
-            child_attrs = fs.stat(child_path)
+            fh, _child_path, _root2, child_attrs = fs.lookup(
+                dir_fh, name, dir_st=dir_attrs
+            )
             res.u32(NFS3_OK)
             res.opaque_var(fh)
             _write_post_op_attr(res, child_attrs)

@@ -261,8 +261,11 @@ class Filesystem:
             return _MappedStat(st, owner[0], owner[1])
         return st
 
-    def _register(self, path: VirtualPath) -> bytes:
-        st = self.stat(path)
+    def _register(
+        self, path: VirtualPath, st: os.stat_result | None = None
+    ) -> bytes:
+        if st is None:
+            st = self.stat(path)
         fh = struct.pack(
             '>QQ',
             st.st_dev & 0xFFFFFFFFFFFFFFFF,
@@ -290,12 +293,16 @@ class Filesystem:
         return self._register(path)
 
     def lookup(
-        self, dir_fh: bytes, name: str
-    ) -> tuple[bytes, VirtualPath, VirtualPath]:
+        self,
+        dir_fh: bytes,
+        name: str,
+        dir_st: os.stat_result | None = None,
+    ) -> tuple[bytes, VirtualPath, VirtualPath, os.stat_result]:
         root, dir_path = self.resolve_fh(dir_fh)
         self._validate_lookup_name(name)
 
-        dir_st = self.stat(dir_path)
+        if dir_st is None:
+            dir_st = self.stat(dir_path)
         if not statmod.S_ISDIR(dir_st.st_mode):
             # Without this, "looking up" a child of e.g. a symlink's own
             # fh would silently string-concatenate a vpath instead of
@@ -311,9 +318,9 @@ class Filesystem:
         else:
             child = dir_path / name
 
-        self.stat(child)
-        fh = self._register(child)
-        return fh, child, root
+        child_st = self.stat(child)
+        fh = self._register(child, st=child_st)
+        return fh, child, root, child_st
 
     def _validate_lookup_name(self, name: str):
         if (
