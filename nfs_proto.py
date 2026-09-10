@@ -5,7 +5,6 @@ import time
 from .const import (
     DONT_CHANGE,
     EXCLUSIVE,
-    FILE_SYNC,
     FSF3_CANSETTIME,
     FSF3_LINK,
     FSF3_SYMLINK,
@@ -20,6 +19,7 @@ from .const import (
     NFS3ERR_NOT_SYNC,
     SET_TO_CLIENT_TIME,
     SET_TO_SERVER_TIME,
+    UNSTABLE,
     NfsError,
 )
 from .fs import Filesystem, fattr3_dict, wcc_attr_dict
@@ -269,18 +269,17 @@ def build_handlers(fs: Filesystem) -> dict[int, Handler]:
         count = args.u32()
         stable = args.u32()
         data = args.opaque_var()
-        del stable
 
         pre = None
         try:
             _root, path = fs.resolve_fh(fh)
             pre = fs.stat(path)
-            fs.write(path, offset, data[:count])
+            fs.write(path, offset, data[:count], stable=(stable != UNSTABLE))
             post = fs.stat(path)
             res.u32(NFS3_OK)
             _write_wcc_data(res, pre, post)
             res.u32(min(count, len(data)))
-            res.u32(FILE_SYNC)
+            res.u32(stable)
             res.opaque_fixed(fs.writeverf(), 8)
         except NfsError as e:
             res.u32(e.status)
@@ -703,6 +702,7 @@ def build_handlers(fs: Filesystem) -> dict[int, Handler]:
         try:
             _root, path = fs.resolve_fh(fh)
             pre = fs.stat(path)
+            fs.commit(path)
             res.u32(NFS3_OK)
             _write_wcc_data(res, pre, pre)
             res.opaque_fixed(fs.writeverf(), 8)

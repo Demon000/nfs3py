@@ -3,6 +3,7 @@ import shutil
 import socket
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from nfs3_server.server import NfsServer
@@ -513,6 +514,84 @@ class OwnershipMappingTestCase(unittest.TestCase):
         real_st = os.stat(self.export_dir / 'created_as_root.txt')
         self.assertNotEqual(real_st.st_uid, 0)
         self.assertEqual(real_st.st_uid, os.getuid())
+
+
+UNSTABLE, DATA_SYNC, FILE_SYNC = 0, 1, 2
+
+
+class WriteStabilityTestCase(unittest.TestCase):
+    """UNSTABLE writes must not fsync on every RPC (that's the whole
+    point of the stability flag - it lets a client batch many writes and
+    force durability once via COMMIT), but a stable WRITE or a COMMIT
+    still must."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp(prefix='nfs3-stability-test-')
+        cls.export_dir = Path(cls.tmpdir) / 'export'
+        cls.export_dir.mkdir()
+        (cls.export_dir / 'f.txt').write_bytes(b'0123456789')
+
+        cls.port = _free_port()
+        config = _NfsConfig(
+            mounts=[(str(cls.export_dir), '/export')],
+            server_ip='127.0.0.1',
+            server_port=str(cls.port),
+        )
+        cls.server = NfsServer(config, lambda s: s)
+        cls.server.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.stop()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def setUp(self):
+        self.client = RpcClient('127.0.0.1', self.port)
+        self.addCleanup(self.client.close)
+        r = self.client.call(100005, 3, MOUNT_MNT, string('/export'))
+        self.assertEqual(r.u32(), 0)
+        self.root_fh = r.opaque()
+        r = self.client.call(
+            100003, 3, LOOKUP, opaque(self.root_fh) + string('f.txt')
+        )
+        self.assertEqual(r.u32(), 0)
+        self.fh = r.opaque()
+        r.skip_post_op_attr()
+        r.skip_post_op_attr()
+
+    def write(self, stable, data=b'x'):
+        args = (
+            opaque(self.fh)
+            + u64(0)
+            + u32(len(data))
+            + u32(stable)
+            + opaque(data)
+        )
+        r = self.client.call(100003, 3, WRITE, args)
+        self.assertEqual(r.u32(), 0)
+        r.skip_wcc_data()
+        r.u32()
+        return r.u32()  # committed
+
+    def test_unstable_write_does_not_fsync(self):
+        with unittest.mock.patch('nfs3_server.fs.os.fsync') as fsync:
+            committed = self.write(UNSTABLE)
+        fsync.assert_not_called()
+        self.assertEqual(committed, UNSTABLE)
+
+    def test_file_sync_write_fsyncs(self):
+        with unittest.mock.patch('nfs3_server.fs.os.fsync') as fsync:
+            committed = self.write(FILE_SYNC)
+        fsync.assert_called_once()
+        self.assertEqual(committed, FILE_SYNC)
+
+    def test_commit_fsyncs(self):
+        with unittest.mock.patch('nfs3_server.fs.os.fsync') as fsync:
+            args = opaque(self.fh) + u64(0) + u32(0)
+            r = self.client.call(100003, 3, COMMIT, args)
+            self.assertEqual(r.u32(), 0)
+        fsync.assert_called_once()
 
 
 if __name__ == '__main__':

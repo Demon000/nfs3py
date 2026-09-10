@@ -364,13 +364,24 @@ class Filesystem:
         eof = offset + len(data) >= size
         return data, eof
 
-    def write(self, path, offset: int, data: bytes):
+    def write(self, path, offset: int, data: bytes, stable: bool):
         try:
             with open(path, 'r+b') as f:
                 f.seek(offset)
                 f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
+                if stable:
+                    f.flush()
+                    os.fsync(f.fileno())
+        except OSError as e:
+            raise_for_oserror(e)
+
+    def commit(self, path):
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         except OSError as e:
             raise_for_oserror(e)
 
