@@ -2,6 +2,7 @@ import os
 import stat as statmod
 import struct
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -219,6 +220,19 @@ class _GraftDirEntry:
         return self._ino
 
 
+_FD_CACHE_IDLE_TIMEOUT_S = 30.0
+_FD_CACHE_MAX_ENTRIES = 256
+
+
+class _OpenFileEntry:
+    __slots__ = ('fd', 'last_used', 'refcount')
+
+    def __init__(self, fd: int):
+        self.fd = fd
+        self.refcount = 0
+        self.last_used = time.monotonic()
+
+
 class Filesystem:
     def __init__(
         self, mounts: list[tuple[str, str]], resolve: Callable[[str], str]
@@ -229,6 +243,17 @@ class Filesystem:
         self._lock = threading.RLock()
         self._writeverf = os.urandom(8)
         self.mount_list: list[tuple[str, str]] = []
+        # Real NFS servers keep already-opened file descriptors around
+        # per file handle, so a SETATTR chmod doesn't retroactively break
+        # a READ/WRITE on a handle that was already permitted at the time
+        # it was first opened - POSIX permission checks happen at open(),
+        # not at every read()/write(). We have no explicit OPEN procedure
+        # (NFSv3 doesn't have one) so the "first touch" of a handle is
+        # what stands in for it. Kept as two separate caches, since a
+        # handle opened for reading shouldn't have to satisfy an O_RDWR
+        # open (and its permission check) it never actually needed.
+        self._read_fds: dict[bytes, _OpenFileEntry] = {}
+        self._write_fds: dict[bytes, _OpenFileEntry] = {}
 
     def writeverf(self) -> bytes:
         return self._writeverf
@@ -389,28 +414,35 @@ class Filesystem:
         del root
         return self._register(dir_path / name)
 
-    def read(self, path, offset: int, count: int) -> tuple[bytes, bool]:
+    def read(
+        self, fh: bytes, path, offset: int, count: int
+    ) -> tuple[bytes, bool]:
+        fd = self._acquire_fd(self._read_fds, fh, path, os.O_RDONLY)
         try:
-            with open(path, 'rb') as f:
-                f.seek(offset)
-                data = f.read(count)
+            # A cached fd may be used by concurrent requests, so use
+            # positioned I/O rather than seek()+read() - pread() doesn't
+            # touch the fd's shared file position, so it can't race with
+            # another thread's concurrent pread()/pwrite() on the same fd.
+            data = os.pread(fd, count, offset)
             size = self.stat(path).st_size
         except OSError as e:
             raise_for_oserror(e)
             raise AssertionError('unreachable')
+        finally:
+            self._release_fd(self._read_fds, fh)
         eof = offset + len(data) >= size
         return data, eof
 
-    def write(self, path, offset: int, data: bytes, stable: bool):
+    def write(self, fh: bytes, path, offset: int, data: bytes, stable: bool):
+        fd = self._acquire_fd(self._write_fds, fh, path, os.O_RDWR)
         try:
-            with open(path, 'r+b') as f:
-                f.seek(offset)
-                f.write(data)
-                if stable:
-                    f.flush()
-                    os.fsync(f.fileno())
+            os.pwrite(fd, data, offset)
+            if stable:
+                os.fsync(fd)
         except OSError as e:
             raise_for_oserror(e)
+        finally:
+            self._release_fd(self._write_fds, fh)
 
     def commit(self, path):
         try:
@@ -483,6 +515,73 @@ class Filesystem:
             stale = [fh for fh, p in self._fh_to_entry.items() if p == path]
             for fh in stale:
                 del self._fh_to_entry[fh]
+        # Deliberately not touching _read_fds/_write_fds here: unlink()ing
+        # or rmdir()ing a path that's still open elsewhere is ordinary,
+        # safe POSIX behavior (the inode stays alive until the last fd
+        # closes), and since fh is already gone from _fh_to_entry no new
+        # acquire can ever be issued against it - idle eviction reaps the
+        # entry on its own.
+
+    def _acquire_fd(
+        self,
+        cache: dict[bytes, _OpenFileEntry],
+        fh: bytes,
+        path,
+        flags: int,
+    ) -> int:
+        with self._lock:
+            entry = cache.get(fh)
+            if entry is None:
+                try:
+                    fd = os.open(path, flags)
+                except OSError as e:
+                    raise_for_oserror(e)
+                    raise AssertionError('unreachable')
+                entry = cache[fh] = _OpenFileEntry(fd)
+                self._evict_idle_locked(cache)
+            entry.refcount += 1
+            entry.last_used = time.monotonic()
+            return entry.fd
+
+    def _release_fd(self, cache: dict[bytes, _OpenFileEntry], fh: bytes):
+        with self._lock:
+            entry = cache.get(fh)
+            if entry is not None:
+                entry.refcount -= 1
+                entry.last_used = time.monotonic()
+
+    def _evict_idle_locked(self, cache: dict[bytes, _OpenFileEntry]):
+        now = time.monotonic()
+        for fh, entry in list(cache.items()):
+            if entry.refcount == 0 and (
+                now - entry.last_used > _FD_CACHE_IDLE_TIMEOUT_S
+            ):
+                os.close(entry.fd)
+                del cache[fh]
+
+        overflow = len(cache) - _FD_CACHE_MAX_ENTRIES
+        if overflow > 0:
+            idle = sorted(
+                (
+                    (fh, entry)
+                    for fh, entry in cache.items()
+                    if entry.refcount == 0
+                ),
+                key=lambda pair: pair[1].last_used,
+            )
+            for fh, entry in idle[:overflow]:
+                os.close(entry.fd)
+                del cache[fh]
+
+    def close_all_open_files(self):
+        with self._lock:
+            for cache in (self._read_fds, self._write_fds):
+                for entry in cache.values():
+                    try:
+                        os.close(entry.fd)
+                    except OSError:
+                        pass
+                cache.clear()
 
     def rename(
         self,

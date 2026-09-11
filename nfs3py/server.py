@@ -25,3 +25,4 @@ class NfsServer:
 
     def stop(self):
         self._rpc.stop()
+        self.fs.close_all_open_files()

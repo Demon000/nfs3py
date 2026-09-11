@@ -253,7 +253,7 @@ def build_handlers(fs: Filesystem) -> dict[int, Handler]:
         try:
             _root, path = fs.resolve_fh(fh)
             st = fs.stat(path)
-            data, eof = fs.read(path, offset, count)
+            data, eof = fs.read(fh, path, offset, count)
             res.u32(NFS3_OK)
             _write_post_op_attr(res, fs.stat(path))
             res.u32(len(data))
@@ -274,7 +274,9 @@ def build_handlers(fs: Filesystem) -> dict[int, Handler]:
         try:
             _root, path = fs.resolve_fh(fh)
             pre = fs.stat(path)
-            fs.write(path, offset, data[:count], stable=(stable != UNSTABLE))
+            fs.write(
+                fh, path, offset, data[:count], stable=(stable != UNSTABLE)
+            )
             post = fs.stat(path)
             res.u32(NFS3_OK)
             _write_wcc_data(res, pre, post)
