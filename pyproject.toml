@@ -20,5 +20,8 @@ classifiers = [
 [project.urls]
 Homepage = 'https://github.com/Demon000/nfs3py'
 
+[project.scripts]
+nfs3py = 'nfs3py.__main__:main'
+
 [tool.setuptools.packages.find]
 include = ['nfs3py*']

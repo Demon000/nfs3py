@@ -7,11 +7,23 @@ privileged bind. ONC RPC, XDR, and NFSv3 itself (all 22 procedures, full
 read/write) are implemented directly from RFC 5531, RFC 4506, and
 RFC 1813.
 
-Import `NfsServer` and start/stop it from inside another process. One
-example: serving a live directory over NFS for the duration of some
-other task.
+Use it standalone via the CLI, or import `NfsServer` and start/stop it
+from inside another process. One example: serving a live directory over
+NFS for the duration of some other task.
 
-## Usage
+## CLI
+
+```
+python3 -m nfs3py --mount /srv/my-rootfs:/srv/my-rootfs --port 2049
+```
+
+Or, after `pip install nfs3py`, just `nfs3py ...` directly. Pass `--mount
+REAL_DIR:EXPORTED_PATH` more than once to serve multiple directories, or
+to graft one directory under another (see below); earlier `--mount`
+entries take precedence over later, overlapping ones. `--host` defaults
+to `0.0.0.0`; `--port` defaults to `2049`. Stop with Ctrl+C.
+
+## Library usage
 
 ```python
 from dataclasses import dataclass
