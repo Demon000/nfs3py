@@ -312,6 +312,7 @@ def build_handlers(fs: Filesystem) -> dict[int, Handler]:
             if sattr is not None:
                 _apply_sattr3(fs, path, sattr)
             fh = fs.fh_for_known_path(root, path)
+            fs.precache_fds(fh, path)
             post_obj = fs.stat(path)
             post_dir = fs.stat(dir_path)
             res.u32(NFS3_OK)

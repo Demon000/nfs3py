@@ -573,6 +573,29 @@ class Filesystem:
                 os.close(entry.fd)
                 del cache[fh]
 
+    def precache_fds(self, fh: bytes, path):
+        # NFSv3 has no OPEN procedure, so there's no earlier RPC for a
+        # freshly created file to hang an eager cache entry off - the
+        # first WRITE/READ *is* the first touch we ever see. For a client
+        # that creates a file, immediately chmods it more restrictively,
+        # then writes/reads through what it considers the same already-
+        # open descriptor, that first touch would already be too late.
+        # Caching read/write fds right at creation time, before any later
+        # SETATTR narrows the mode, is the closest we can get to that
+        # "permission checked once, at open" semantic without one.
+        with self._lock:
+            for cache, flags in (
+                (self._read_fds, os.O_RDONLY),
+                (self._write_fds, os.O_RDWR),
+            ):
+                if fh in cache:
+                    continue
+                try:
+                    fd = os.open(path, flags)
+                except OSError:
+                    continue
+                cache[fh] = _OpenFileEntry(fd)
+
     def close_all_open_files(self):
         with self._lock:
             for cache in (self._read_fds, self._write_fds):

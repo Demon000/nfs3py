@@ -306,6 +306,32 @@ class Nfs3ServerTestCase(unittest.TestCase):
         r = self.client.call(100003, 3, COMMIT, args)
         self.assertEqual(r.u32(), 0)
 
+    def test_write_and_read_succeed_after_chmod_zero_on_same_handle(self):
+        # Mirrors cthon04's special/op_chmod.c: create, chmod(0), then
+        # write/read through the handle obtained at create time. A fresh
+        # per-RPC open() would see the now-zero mode and fail with EACCES
+        # - fds are pre-warmed at CREATE time specifically so this still
+        # works, matching local open()-time permission semantics.
+        fh = self.create(self.root_fh, 'chmod_then_write.txt')
+
+        args = (
+            opaque(fh)
+            + u32(1)
+            + u32(0)  # mode set to 0
+            + u32(0)  # uid not set
+            + u32(0)  # gid not set
+            + u32(0)  # size not set
+            + u32(0)  # atime DONT_CHANGE
+            + u32(0)  # mtime DONT_CHANGE
+            + u32(0)  # sattrguard3.check
+        )
+        r = self.client.call(100003, 3, SETATTR, args)
+        self.assertEqual(r.u32(), 0)
+
+        self.write(fh, 0, b'written after chmod 0')
+        data, _eof = self.read(fh, 0, 4096)
+        self.assertEqual(data, b'written after chmod 0')
+
 
 class GraftedMountTestCase(unittest.TestCase):
     """A second real directory grafted onto a sub-path of an export -
