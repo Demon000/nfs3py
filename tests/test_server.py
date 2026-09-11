@@ -372,6 +372,27 @@ class GraftedMountTestCase(unittest.TestCase):
         foo_fh = self.lookup(modules_fh, 'foo.ko')
         self.assertEqual(self.read(foo_fh), b'from graft\n')
 
+    def test_readdir_of_parent_includes_graft_entry(self):
+        # 'modules' has no real on-disk entry under export_dir/lib - only
+        # LOOKUP-by-name resolves it via resolve_real_path(). A plain
+        # READDIR of the parent must still list it, or anything that
+        # discovers files by listing (ls, find, depmod) would silently
+        # miss the whole grafted tree.
+        lib_fh = self.lookup(self.root_fh, 'lib')
+        args = opaque(lib_fh) + u64(0) + b'\x00' * 8 + u32(4096)
+        r = self.client.call(100003, 3, READDIR, args)
+        self.assertEqual(r.u32(), 0)
+        r.skip_post_op_attr()
+        r.opaque_fixed(8)
+        names = []
+        while r.bool():
+            r.u64()
+            names.append(r.string())
+            r.u64()
+        self.assertTrue(r.bool())
+        self.assertIn('modules', names)
+        self.assertIn('libc.so.fake', names)
+
     def test_graft_does_not_shadow_sibling_files(self):
         lib_fh = self.lookup(self.root_fh, 'lib')
         libc_fh = self.lookup(lib_fh, 'libc.so.fake')

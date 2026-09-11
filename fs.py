@@ -200,6 +200,25 @@ class VirtualPath:
         return VirtualPath(self._fs, self.export_root, parent_vpath)
 
 
+class _GraftDirEntry:
+    """Stands in for an os.DirEntry when listing a directory that a graft
+    is mounted under but which has no corresponding real on-disk entry -
+    e.g. a virtual root/pyrotux graft when the real exported rootfs has
+    no root/pyrotux of its own. Only .name/.inode() are ever read off
+    scandir_sorted()'s results, so duck-typing just those two is enough
+    for grafts to show up in READDIR/READDIRPLUS, not just direct
+    LOOKUP-by-name."""
+
+    __slots__ = ('_ino', 'name')
+
+    def __init__(self, name: str, ino: int):
+        self.name = name
+        self._ino = ino
+
+    def inode(self) -> int:
+        return self._ino
+
+
 class Filesystem:
     def __init__(
         self, mounts: list[tuple[str, str]], resolve: Callable[[str], str]
@@ -336,13 +355,31 @@ class Filesystem:
         if name in ('.', '..'):
             raise NfsError(NFS3ERR_EXIST)
 
-    def scandir_sorted(self, dir_path) -> list[os.DirEntry]:
+    def _graft_child_names(self, vpath: str) -> list[str]:
+        names = []
+        for _dst_file_path, src_file_path in self._mounts_cfg:
+            virt = self._resolve(src_file_path)
+            if virt and _vpath_dirname(virt) == vpath:
+                names.append(virt.rsplit('/', 1)[-1])
+        return names
+
+    def scandir_sorted(self, dir_path: VirtualPath) -> list:
         try:
             with os.scandir(dir_path) as it:
                 entries = list(it)
         except OSError as e:
             raise_for_oserror(e)
             raise AssertionError('unreachable')
+
+        real_names = {e.name for e in entries}
+        for name in self._graft_child_names(dir_path.vpath):
+            # A graft mounted directly under this directory has no real
+            # on-disk entry of its own here - LOOKUP resolves it fine via
+            # resolve_real_path(), but a plain scandir() never would.
+            if name not in real_names:
+                child = dir_path / name
+                entries.append(_GraftDirEntry(name, self.stat(child).st_ino))
+
         entries.sort(key=lambda e: e.name)
         return entries
 
