@@ -113,10 +113,16 @@ Restarting the server invalidates every outstanding handle (clients see
 python3 -m unittest nfs3py.tests.test_server
 ```
 
-The Connectathon (`cthon04`) suite can also be run against the server via
+```
+./cthon04-nfs-test.sh
+```
+
+Runs the real Connectathon (`cthon04`) test suite against the server via
 [`fuse-nfs`](https://github.com/sahlberg/fuse-nfs)/`libnfs`, entirely
 without root (`mount(2)` for NFS is blocked in unprivileged user
-namespaces, but a FUSE bridge isn't).
+namespaces, but a FUSE bridge isn't). First run clones and builds
+`cthon04` and `fuse-nfs` into `.cache/`; pass `-c` to rebuild both from
+scratch.
 
 ## License
 
