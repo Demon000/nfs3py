@@ -6,7 +6,7 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from nfs3_server.server import NfsServer
+from nfs3py.server import NfsServer
 
 from .rpc_client import (
     RpcClient,
@@ -596,19 +596,19 @@ class WriteStabilityTestCase(unittest.TestCase):
         return r.u32()  # committed
 
     def test_unstable_write_does_not_fsync(self):
-        with unittest.mock.patch('nfs3_server.fs.os.fsync') as fsync:
+        with unittest.mock.patch('nfs3py.fs.os.fsync') as fsync:
             committed = self.write(UNSTABLE)
         fsync.assert_not_called()
         self.assertEqual(committed, UNSTABLE)
 
     def test_file_sync_write_fsyncs(self):
-        with unittest.mock.patch('nfs3_server.fs.os.fsync') as fsync:
+        with unittest.mock.patch('nfs3py.fs.os.fsync') as fsync:
             committed = self.write(FILE_SYNC)
         fsync.assert_called_once()
         self.assertEqual(committed, FILE_SYNC)
 
     def test_commit_fsyncs(self):
-        with unittest.mock.patch('nfs3_server.fs.os.fsync') as fsync:
+        with unittest.mock.patch('nfs3py.fs.os.fsync') as fsync:
             args = opaque(self.fh) + u64(0) + u32(0)
             r = self.client.call(100003, 3, COMMIT, args)
             self.assertEqual(r.u32(), 0)

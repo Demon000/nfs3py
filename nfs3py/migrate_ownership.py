@@ -1,11 +1,11 @@
 """One-time, offline preparation for exporting a real-permissions rootfs
-through nfs3_server without running the server itself privileged.
+through nfs3py without running the server itself privileged.
 
-nfs3_server always runs as whatever unprivileged OS user starts
-com_wrapper, and Linux enforces file permission checks against that real
-process uid regardless of what the NFS client claims - so root-owned,
-owner-only files (/etc/shadow, SSH host keys, ...) are unreadable to it,
-breaking anything that needs them (login, sshd, ...).
+nfs3py always runs as whatever unprivileged OS user starts it, and Linux
+enforces file permission checks against that real process uid regardless
+of what the NFS client claims - so root-owned, owner-only files
+(/etc/shadow, SSH host keys, ...) are unreadable to it, breaking anything
+that needs them (login, sshd, ...).
 
 This script fixes that once, offline, rather than needing the live server
 to run privileged: for every file under the given tree, it records the
@@ -22,8 +22,8 @@ re-run after adding files, or after an interrupted/partial previous run.
 
 Usage (needs to run as root, or as whoever already owns every file under
 the tree - typically neither is true for a real rootfs, hence sudo):
-    sudo python3 -m nfs3_server.migrate_ownership /srv/nfs/some-rootfs
-    sudo python3 -m nfs3_server.migrate_ownership /srv/nfs/some-rootfs --uid 1000 --gid 1000
+    sudo python3 -m nfs3py.migrate_ownership /srv/nfs/some-rootfs
+    sudo python3 -m nfs3py.migrate_ownership /srv/nfs/some-rootfs --uid 1000 --gid 1000
 """
 
 import argparse
