@@ -242,6 +242,8 @@ class Filesystem:
         self._resolve = resolve
         self._fh_to_entry: dict[bytes, VirtualPath] = {}
         self._lock = threading.RLock()
+        self._handle_index_rebuild_lock = threading.Lock()
+        self._handle_index_rebuilt = False
         self._writeverf = os.urandom(8)
         self.mount_list: list[tuple[str, str]] = []
         # Real NFS servers keep already-opened file descriptors around
@@ -332,8 +334,92 @@ class Filesystem:
         with self._lock:
             entry = self._fh_to_entry.get(fh)
         if entry is None:
+            self._rebuild_handle_index()
+            with self._lock:
+                entry = self._fh_to_entry.get(fh)
+        if entry is None:
             raise NfsError(NFS3ERR_STALE)
         return VirtualPath(self, entry.export_root, entry.export_root), entry
+
+    def _export_root_for(self, vpath: str) -> str:
+        roots = [
+            root
+            for root in self.refresh_exports()
+            if root == '/'
+            or vpath == root
+            or vpath.startswith(root.rstrip('/') + '/')
+        ]
+        if not roots:
+            raise NfsError(NFS3ERR_STALE)
+        return min(roots, key=len)
+
+    def _rebuild_handle_index(self):
+        """Recover stable NFS handles after a server restart.
+
+        File handles contain the backing filesystem's device and inode
+        numbers.  The live path table is only a cache, so reconstruct it by
+        walking the configured exports when a client presents an otherwise
+        unknown handle.  This is necessarily slower than a filesystem's
+        native inode lookup, but only happens once after a restart.
+        """
+        with self._handle_index_rebuild_lock:
+            if self._handle_index_rebuilt:
+                return
+            self._rebuild_handle_index_locked()
+            self._handle_index_rebuilt = True
+
+    def _rebuild_handle_index_locked(self):
+        recovered: dict[bytes, VirtualPath] = {}
+
+        for virtual_root, real_root in self.refresh_exports().items():
+            virtual_root = virtual_root.rstrip('/') or '/'
+            try:
+                walker = os.walk(real_root, followlinks=False)
+                for real_dir, dirnames, filenames in walker:
+                    names = [''] + dirnames + filenames
+                    for name in names:
+                        real_path = (
+                            Path(real_dir) / name if name else Path(real_dir)
+                        )
+                        relative = real_path.relative_to(real_root)
+                        vpath = virtual_root
+                        if relative.parts:
+                            suffix = '/'.join(relative.parts)
+                            vpath = _vpath_join(virtual_root, suffix)
+
+                        # A higher-priority graft may shadow an on-disk path
+                        # in a broader export.  Only index the path that the
+                        # NFS client can actually reach.
+                        try:
+                            active_real_path = os.path.abspath(
+                                os.fspath(self.resolve_real_path(vpath))
+                            )
+                        except NfsError:
+                            continue
+                        if active_real_path != os.path.abspath(real_path):
+                            continue
+
+                        try:
+                            st = self.stat(real_path)
+                        except NfsError:
+                            continue
+                        handle = struct.pack(
+                            '>QQ',
+                            st.st_dev & 0xFFFFFFFFFFFFFFFF,
+                            st.st_ino & 0xFFFFFFFFFFFFFFFF,
+                        )
+                        recovered.setdefault(
+                            handle,
+                            VirtualPath(
+                                self, self._export_root_for(vpath), vpath
+                            ),
+                        )
+            except OSError:
+                continue
+
+        with self._lock:
+            for handle, path in recovered.items():
+                self._fh_to_entry.setdefault(handle, path)
 
     def fh_for_known_path(self, root, path: VirtualPath) -> bytes:
         del root

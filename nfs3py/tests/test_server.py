@@ -497,6 +497,63 @@ class RootExportTestCase(unittest.TestCase):
         self.assertEqual(self.lookup(bin_fh, '..'), usr_fh)
 
 
+class ServerRestartTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix='nfs3-restart-test-')
+        self.export_dir = Path(self.tmpdir) / 'export'
+        self.graft_dir = Path(self.tmpdir) / 'modules'
+        (self.export_dir / 'usr' / 'lib').mkdir(parents=True)
+        self.graft_dir.mkdir()
+        (self.graft_dir / 'test.ko').write_bytes(b'module\n')
+        self.port = _free_port()
+        self.config = _NfsConfig(
+            mounts=[
+                (str(self.graft_dir), '/usr/lib/modules'),
+                (str(self.export_dir), '/'),
+            ],
+            server_ip='127.0.0.1',
+            server_port=str(self.port),
+        )
+        self.server = NfsServer(self.config, lambda s: s)
+        self.server.start()
+
+    def tearDown(self):
+        self.server.stop()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def lookup(self, client, dir_fh, name):
+        r = client.call(100003, 3, LOOKUP, opaque(dir_fh) + string(name))
+        self.assertEqual(r.u32(), 0)
+        fh = r.opaque()
+        r.skip_post_op_attr()
+        r.skip_post_op_attr()
+        return fh
+
+    def test_file_handle_survives_server_restart(self):
+        client = RpcClient('127.0.0.1', self.port)
+        r = client.call(100005, 3, MOUNT_MNT, string('/'))
+        self.assertEqual(r.u32(), 0)
+        root_fh = r.opaque()
+        usr_fh = self.lookup(client, root_fh, 'usr')
+        lib_fh = self.lookup(client, usr_fh, 'lib')
+        modules_fh = self.lookup(client, lib_fh, 'modules')
+        module_fh = self.lookup(client, modules_fh, 'test.ko')
+
+        client.close()
+        self.server.stop()
+        self.server = NfsServer(self.config, lambda s: s)
+        self.server.start()
+
+        client = RpcClient('127.0.0.1', self.port)
+        self.addCleanup(client.close)
+        r = client.call(100003, 3, READ, opaque(module_fh) + u64(0) + u32(64))
+        self.assertEqual(r.u32(), 0)
+        r.skip_post_op_attr()
+        self.assertEqual(r.u32(), len(b'module\n'))
+        self.assertTrue(r.bool())
+        self.assertEqual(r.opaque(), b'module\n')
+
+
 class OwnershipMappingTestCase(unittest.TestCase):
     """Lets the server report ownership (e.g. root-owned system files)
     that differs from the real host uid/gid it's actually running as -
