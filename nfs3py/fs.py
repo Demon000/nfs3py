@@ -279,6 +279,8 @@ class Filesystem:
 
             if vpath == virt:
                 rel = ''
+            elif virt == '/' and vpath.startswith('/'):
+                rel = vpath[1:]
             elif vpath.startswith(virt + '/'):
                 rel = vpath[len(virt) + 1 :]
             else:

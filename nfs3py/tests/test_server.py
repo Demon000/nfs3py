@@ -443,6 +443,55 @@ class GraftedMountTestCase(unittest.TestCase):
         )
 
 
+class RootExportTestCase(unittest.TestCase):
+    """An export mounted at / must resolve children without producing //."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp(prefix='nfs3-root-export-test-')
+        cls.export_dir = Path(cls.tmpdir) / 'export'
+        (cls.export_dir / 'dev').mkdir(parents=True)
+        (cls.export_dir / 'usr' / 'bin').mkdir(parents=True)
+        (cls.export_dir / 'usr' / 'bin' / 'init').write_bytes(b'init\n')
+
+        cls.port = _free_port()
+        config = _NfsConfig(
+            mounts=[(str(cls.export_dir), '/')],
+            server_ip='127.0.0.1',
+            server_port=str(cls.port),
+        )
+        cls.server = NfsServer(config, lambda s: s)
+        cls.server.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.stop()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def setUp(self):
+        self.client = RpcClient('127.0.0.1', self.port)
+        self.addCleanup(self.client.close)
+        r = self.client.call(100005, 3, MOUNT_MNT, string('/'))
+        self.assertEqual(r.u32(), 0)
+        self.root_fh = r.opaque()
+
+    def lookup(self, dir_fh, name):
+        r = self.client.call(100003, 3, LOOKUP, opaque(dir_fh) + string(name))
+        self.assertEqual(r.u32(), 0)
+        fh = r.opaque()
+        r.skip_post_op_attr()
+        r.skip_post_op_attr()
+        return fh
+
+    def test_lookup_child_of_root_export(self):
+        self.lookup(self.root_fh, 'dev')
+
+    def test_lookup_nested_child_of_root_export(self):
+        usr_fh = self.lookup(self.root_fh, 'usr')
+        bin_fh = self.lookup(usr_fh, 'bin')
+        self.lookup(bin_fh, 'init')
+
+
 class OwnershipMappingTestCase(unittest.TestCase):
     """Lets the server report ownership (e.g. root-owned system files)
     that differs from the real host uid/gid it's actually running as -
