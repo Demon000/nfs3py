@@ -195,6 +195,7 @@ class VirtualPath:
         parent_vpath = _vpath_dirname(self.vpath)
         if not (
             parent_vpath == self.export_root
+            or self.export_root == '/'
             or parent_vpath.startswith(self.export_root + '/')
         ):
             parent_vpath = self.export_root

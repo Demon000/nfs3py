@@ -491,6 +491,11 @@ class RootExportTestCase(unittest.TestCase):
         bin_fh = self.lookup(usr_fh, 'bin')
         self.lookup(bin_fh, 'init')
 
+    def test_dotdot_inside_root_export(self):
+        usr_fh = self.lookup(self.root_fh, 'usr')
+        bin_fh = self.lookup(usr_fh, 'bin')
+        self.assertEqual(self.lookup(bin_fh, '..'), usr_fh)
+
 
 class OwnershipMappingTestCase(unittest.TestCase):
     """Lets the server report ownership (e.g. root-owned system files)
